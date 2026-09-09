@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Lumen
+Comment=Minimal single-window image viewer
+Exec=/usr/local/bin/lumen %F
+Icon=lumen
+Type=Application
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/tga;image/x-tga;image/x-portable-pixmap;image/x-portable-graymap;image/x-portable-bitmap;
+Terminal=false
+StartupNotify=false
+StartupWMClass=lumen

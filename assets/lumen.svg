@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Background: dark rounded square -->
+  <rect width="256" height="256" rx="51" fill="#1A1B2E"/>
+
+  <!-- Outer lens body -->
+  <circle cx="128" cy="128" r="105" fill="#252840"/>
+  <circle cx="128" cy="128" r="105" fill="none" stroke="#454878" stroke-width="6.5"/>
+
+  <!-- Middle glass element -->
+  <circle cx="128" cy="128" r="77" fill="#1C1F40"/>
+  <circle cx="128" cy="128" r="77" fill="none" stroke="#5860A0" stroke-width="4.5"/>
+
+  <!-- Inner bright element -->
+  <circle cx="128" cy="128" r="41" fill="#6870D8" opacity="0.6"/>
+  <circle cx="128" cy="128" r="20" fill="#AABCFF" opacity="0.7"/>
+
+  <!-- Specular highlight (top-left) -->
+  <circle cx="112" cy="112" r="11" fill="#FFFFFF" opacity="0.18"/>
+</svg>
