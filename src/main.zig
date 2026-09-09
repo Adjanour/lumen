@@ -8,7 +8,7 @@ const image = @import("image.zig");
 const TAB_H: i32 = 32;
 const TAB_PAD: i32 = 12;
 
-// ── Tabs: data-oriented tab list ──────────────────────────────────────────
+//Tabs
 //
 // Two parallel arrays kept permanently in sync:
 //   paths[i]  — null-terminated path string
@@ -63,8 +63,7 @@ const Tabs = struct {
     }
 };
 
-// ── Utilities ─────────────────────────────────────────────────────────────
-
+//Utilities
 fn basename(path: []const u8) []const u8 {
     var i = path.len;
     while (i > 0) : (i -= 1) {
@@ -133,11 +132,10 @@ fn closeTabAt(
     return true;
 }
 
-// ── Window icon ──────────────────────────────────────────────────────────────
+// Window icon
 
 /// Decode the embedded PNG and hand it to SDL as the window icon.
-/// The 64×64 PNG is embedded at compile time via @embedFile; no file I/O at
-/// runtime and no extra dependency beyond stb_image (already linked).
+/// The 64×64 PNG is embedded at compile time via @embedFile
 fn setWindowIcon(window: *c.SDL_Window) void {
     const png = @embedFile("lumen-icon.png");
     var w: c_int = 0;
@@ -168,7 +166,7 @@ fn setWindowIcon(window: *c.SDL_Window) void {
     c.SDL_SetWindowIcon(window, surface);
 }
 
-// ── Empty-state rendering ────────────────────────────────────────────────
+//Empty-state rendering
 
 /// Render a single line of text centred at (cx, cy).
 fn renderCenteredText(
@@ -223,7 +221,7 @@ fn renderEmptyState(
     );
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────
+//Entry point
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -231,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
     image.global_io = io;
     const args = try init.minimal.args.toSlice(allocator);
 
-    // ── Single-instance handoff ──────────────────────────────────────────
+    //Single-instance handoff
     const spath = try sock.socketPath(allocator);
     const spath_z = try allocator.dupeZ(u8, spath);
 
@@ -247,7 +245,7 @@ pub fn main(init: std.process.Init) !void {
     const server = try sock.Server.init(spath);
     defer server.deinit(spath_z);
 
-    // ── SDL setup ────────────────────────────────────────────────────────
+    //SDL setup
     if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SDLInitFailed;
@@ -287,7 +285,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer c.SDL_DestroyRenderer(renderer);
 
-    // ── Initial tab list ─────────────────────────────────────────────────
+    //Initial tab list
     var tabs: Tabs = .empty;
     for (args[1..]) |p| try tabs.append(allocator, font, p);
 
@@ -300,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer image.cleanup();
 
-    // ── Event / render loop ──────────────────────────────────────────────
+    //Event / render loop
     var running = true;
     var read_buf: [4096]u8 = undefined;
     var pending: std.ArrayList(u8) = .empty;
@@ -330,7 +328,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // ── Input ────────────────────────────────────────────────────────
+        //Input
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event) != 0) {
             switch (event.type) {
@@ -401,7 +399,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // ── Render ───────────────────────────────────────────────────────
+        //Render
         _ = c.SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
         _ = c.SDL_RenderClear(renderer);
 

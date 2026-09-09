@@ -2,13 +2,12 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 
-// ── Global I/O handle ──────────────────────────────────────────────────────
+//Global I/O handle
 // Set once at startup by main before any image function is called.
 
 pub var global_io: std.Io = undefined;
 
-// ── Types ──────────────────────────────────────────────────────────────────
-
+//Types
 pub const Image = struct {
     texture: *c.SDL_Texture,
     w: i32,
@@ -33,7 +32,7 @@ const Preload = struct {
 var preload: Preload = .{};
 var preload_inflight: bool = false;
 
-// ── Format detection ───────────────────────────────────────────────────────
+//Format detection
 
 pub fn isJpegExt(path: [:0]const u8) bool {
     const s = std.mem.sliceTo(path.ptr, 0);
@@ -42,7 +41,7 @@ pub fn isJpegExt(path: [:0]const u8) bool {
     return false;
 }
 
-// ── Pixel loading ──────────────────────────────────────────────────────────
+//Pixel loading
 
 /// Decode a JPEG using libjpeg-turbo (faster than stb_image for JPEGs).
 /// Returns a heap-allocated RGBA buffer; caller frees with c_allocator.
@@ -118,7 +117,7 @@ fn loadPixelsStb(path: [:0]const u8, w: *c_int, h: *c_int) ?[]u8 {
     return out;
 }
 
-// ── Public API ─────────────────────────────────────────────────────────────
+//Public API
 
 /// Load an image as an SDL texture. Checks the preload cache first.
 pub fn loadImage(renderer: *c.SDL_Renderer, path: [:0]const u8) !Image {

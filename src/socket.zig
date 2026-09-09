@@ -2,7 +2,7 @@
 /// client handoff, and the non-blocking epoll-backed server.
 const std = @import("std");
 
-// ── Raw syscall helpers ────────────────────────────────────────────────────
+//Raw syscall helpers
 //
 // std.os.linux.* wrappers return `usize` using the raw kernel convention:
 //   success  →  value >= 0  (often an fd or byte count)
@@ -43,7 +43,7 @@ pub fn writeAll(fd: i32, data: []const u8) void {
     }
 }
 
-// ── Socket path ────────────────────────────────────────────────────────────
+//Socket path
 
 /// Return the path to use for the IPC socket.
 /// Prefers $XDG_RUNTIME_DIR (tmpfs, per-user, cleared on logout).
@@ -57,7 +57,7 @@ pub fn socketPath(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "/tmp/lumen-{d}.sock", .{uid});
 }
 
-// ── Client handoff ─────────────────────────────────────────────────────────
+//Client handoff
 
 /// Try to connect to an already-running instance and send it the paths.
 /// Returns true if the handoff succeeded — the caller should then exit.
@@ -93,7 +93,7 @@ pub fn tryHandoff(
     return true;
 }
 
-// ── Server ─────────────────────────────────────────────────────────────────
+//Server
 
 /// A non-blocking Unix-domain socket server backed by epoll.
 ///
