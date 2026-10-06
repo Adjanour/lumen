@@ -97,3 +97,12 @@ row), click or Enter opens, Esc exits.
 Not attempted. Native Wayland/EGL is a rewrite of the render and input
 stacks, not an improvement to this one. Everything above keeps the
 SDL2 backend.
+
+## Zoom / pan (follow-up)
+
+`View` holds zoom (relative to fit, 1.0 = fit) plus a screen-pixel pan
+offset. Wheel zooms 1.2x per notch anchored at the cursor; `+`/`-`
+step 1.25x about the center; `0` resets to fit; `1` jumps to actual
+size (`ew / fit_w`); dragging pans with the offset clamped to half the
+rendered size so the picture can't be lost. Zoom resets on every
+navigation; the title shows the percentage when it isn't 100%.

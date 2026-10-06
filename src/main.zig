@@ -138,15 +138,63 @@ fn setTitle(
     path: [:0]const u8,
     index: usize,
     total: usize,
+    zoom: f32,
 ) void {
-    const title = std.fmt.allocPrintSentinel(
-        allocator,
-        "Lumen - {s} ({d}/{d})",
-        .{ std.mem.sliceTo(path.ptr, 0), index + 1, total },
-        0,
-    ) catch return;
+    const pct: i32 = @intFromFloat(@round(zoom * 100));
+    const title = if (pct == 100)
+        std.fmt.allocPrintSentinel(
+            allocator,
+            "Lumen - {s} ({d}/{d})",
+            .{ std.mem.sliceTo(path.ptr, 0), index + 1, total },
+            0,
+        ) catch return
+    else
+        std.fmt.allocPrintSentinel(
+            allocator,
+            "Lumen - {s} ({d}/{d}) {d}%",
+            .{ std.mem.sliceTo(path.ptr, 0), index + 1, total, pct },
+            0,
+        ) catch return;
     defer allocator.free(title);
     c.SDL_SetWindowTitle(window, title.ptr);
+}
+
+/// Fit-to-window dimensions for an ew×eh image in win_w×avail_h.
+/// Pure ratio math shared by the render loop and the zoom handlers.
+fn fitDims(ew: i32, eh: i32, win_w: i32, avail_h: i32) struct { w: i32, h: i32 } {
+    const img_ratio = @as(f32, @floatFromInt(ew)) / @as(f32, @floatFromInt(eh));
+    const win_ratio = @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(avail_h));
+    if (img_ratio > win_ratio) {
+        const w = win_w;
+        const h: i32 = @intFromFloat(@as(f32, @floatFromInt(win_w)) / img_ratio);
+        return .{ .w = w, .h = h };
+    } else {
+        const h = avail_h;
+        const w: i32 = @intFromFloat(@as(f32, @floatFromInt(avail_h)) * img_ratio);
+        return .{ .w = w, .h = h };
+    }
+}
+
+/// Clamp a pan offset so the image center never leaves the window by more
+/// than half the rendered size — the picture can't be lost off-screen.
+fn clampPan(off: f32, rendered: i32) f32 {
+    const lim = @as(f32, @floatFromInt(rendered)) / 2;
+    if (off < -lim) return -lim;
+    if (off > lim) return lim;
+    return off;
+}
+
+/// Rendered image dimensions at the given zoom for a win_w×avail_h window.
+/// EXIF-transposed images (orientations 5-8) fit against swapped dims.
+fn renderedSize(img: image.Image, win_w: i32, avail_h: i32, zoom: f32) struct { w: i32, h: i32 } {
+    const swapped = img.orientation >= 5;
+    const ew: i32 = if (swapped) img.h else img.w;
+    const eh: i32 = if (swapped) img.w else img.h;
+    const fit = fitDims(ew, eh, win_w, avail_h);
+    return .{
+        .w = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(fit.w)) * zoom))),
+        .h = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(fit.h)) * zoom))),
+    };
 }
 
 /// Warm both neighbors of the selected tab: N+1 into the forward slot,
@@ -157,6 +205,20 @@ fn warmNeighbors(tabs: *const Tabs, index: usize) void {
     if (index > 0) image.preloadPrev(tabs.paths.items[index - 1]);
 }
 
+/// Zoom/pan view state. zoom is relative to fit (1.0 = fit to window);
+/// ox/oy are screen-pixel offsets from center. Reset on navigation.
+const View = struct {
+    zoom: f32 = 1.0,
+    ox: f32 = 0,
+    oy: f32 = 0,
+
+    fn reset(self: *View) void {
+        self.zoom = 1.0;
+        self.ox = 0;
+        self.oy = 0;
+    }
+};
+
 /// Close the tab at `target`, adjust `index`, and reload if needed.
 /// Fixes the original bug where clicking any close button always closed the
 /// currently-selected tab rather than the one that was clicked.
@@ -165,6 +227,7 @@ fn closeTabAt(
     cache: *ThumbCache,
     current: *?image.Image,
     index: *usize,
+    view: *View,
     target: usize,
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
@@ -186,6 +249,7 @@ fn closeTabAt(
         // The current tab was closed; load whatever is now at the same slot.
         if (current.*) |img| image.destroy(img.texture);
         if (index.* >= tabs.len()) index.* = tabs.len() - 1;
+        view.reset();
         if (image.loadImage(renderer, tabs.paths.items[index.*])) |img| {
             current.* = img;
         } else |_| {
@@ -196,7 +260,7 @@ fn closeTabAt(
         index.* -= 1; // a tab before current was removed, shift index left
     }
 
-    setTitle(window, allocator, tabs.paths.items[index.*], index.*, tabs.len());
+    setTitle(window, allocator, tabs.paths.items[index.*], index.*, tabs.len(), view.zoom);
     warmNeighbors(tabs, index.*);
     _ = font;
     return true;
@@ -538,6 +602,15 @@ pub fn main(init: std.process.Init) !void {
     };
     defer c.SDL_DestroyRenderer(renderer);
 
+    //Zoom/pan view state (reset on every navigation).
+    var view: View = .{};
+    // Mouse drag-to-pan tracking.
+    var panning: bool = false;
+    var pan_sx: i32 = 0;
+    var pan_sy: i32 = 0;
+    var pan_ox: f32 = 0;
+    var pan_oy: f32 = 0;
+
     //Initial tab list
     var tabs: Tabs = .empty;
     for (args[1..]) |p| try tabs.append(allocator, font, p);
@@ -557,13 +630,13 @@ pub fn main(init: std.process.Init) !void {
         }
         if (loaded) |li| {
             index = li;
-            setTitle(window, allocator, tabs.paths.items[li], li, tabs.len());
+            setTitle(window, allocator, tabs.paths.items[li], li, tabs.len(), view.zoom);
             warmNeighbors(&tabs, li);
         } else {
             // Nothing decodable: keep the tabs so the user can see what
             // failed, with the first tab selected.
             index = 0;
-            setTitle(window, allocator, tabs.paths.items[0], 0, tabs.len());
+            setTitle(window, allocator, tabs.paths.items[0], 0, tabs.len(), view.zoom);
         }
     }
     defer image.cleanup();
@@ -598,8 +671,9 @@ pub fn main(init: std.process.Init) !void {
                     if (current) |old| image.destroy(old.texture);
                     current = img;
                     index = old_len;
+                    view.reset();
                 } else |_| {}
-                setTitle(window, allocator, tabs.paths.items[index], index, tabs.len());
+                setTitle(window, allocator, tabs.paths.items[index], index, tabs.len(), view.zoom);
                 c.SDL_RaiseWindow(window);
                 warmNeighbors(&tabs, index);
             }
@@ -624,7 +698,8 @@ pub fn main(init: std.process.Init) !void {
                                     if (current) |old| image.destroy(old.texture);
                                     current = img;
                                     index = tab;
-                                    setTitle(window, allocator, tabs.paths.items[tab], tab, tabs.len());
+                                    view.reset();
+                                    setTitle(window, allocator, tabs.paths.items[tab], tab, tabs.len(), view.zoom);
                                     warmNeighbors(&tabs, tab);
                                 } else |_| {}
                             }
@@ -641,7 +716,7 @@ pub fn main(init: std.process.Init) !void {
                             {
                                 // Pass `i` so we close the clicked tab, not
                                 // necessarily the currently-selected one.
-                                _ = closeTabAt(&tabs, &thumbs, &current, &index, i, allocator, renderer, window, font);
+                                _ = closeTabAt(&tabs, &thumbs, &current, &index, &view, i, allocator, renderer, window, font);
                                 // Don't exit when the last tab closes — show
                                 // the empty state and wait for new handoffs.
                                 break;
@@ -652,13 +727,76 @@ pub fn main(init: std.process.Init) !void {
                                         if (current) |old| image.destroy(old.texture);
                                         current = img;
                                         index = i;
-                                        setTitle(window, allocator, tabs.paths.items[i], i, tabs.len());
+                                        view.reset();
+                                        setTitle(window, allocator, tabs.paths.items[i], i, tabs.len(), view.zoom);
                                         warmNeighbors(&tabs, i);
                                     } else |_| {}
                                 }
                                 break;
                             }
                             x += tab_w;
+                        }
+                    } else if (event.button.button == c.SDL_BUTTON_LEFT and tabs.len() > 0) {
+                        // Begin drag-to-pan in the image area.
+                        panning = true;
+                        pan_sx = event.button.x;
+                        pan_sy = event.button.y;
+                        pan_ox = view.ox;
+                        pan_oy = view.oy;
+                    }
+                },
+
+                c.SDL_MOUSEBUTTONUP => {
+                    panning = false;
+                },
+
+                c.SDL_MOUSEMOTION => {
+                    if (panning and !grid and current != null) {
+                        if (current) |img| {
+                            var win_w: c_int = 0;
+                            var win_h: c_int = 0;
+                            c.SDL_GetWindowSize(window, &win_w, &win_h);
+                            const rs = renderedSize(img, win_w, win_h - TAB_H, view.zoom);
+                            view.ox = clampPan(pan_ox + @as(f32, @floatFromInt(event.motion.x - pan_sx)), rs.w);
+                            view.oy = clampPan(pan_oy + @as(f32, @floatFromInt(event.motion.y - pan_sy)), rs.h);
+                        }
+                    }
+                },
+
+                c.SDL_MOUSEWHEEL => {
+                    // Cursor-anchored zoom: the point under the cursor stays
+                    // put while the scale changes around it.
+                    if (!grid and tabs.len() > 0) {
+                        const steps = event.wheel.y;
+                        if (steps != 0) {
+                            if (current) |img| {
+                                var win_w: c_int = 0;
+                                var win_h: c_int = 0;
+                                c.SDL_GetWindowSize(window, &win_w, &win_h);
+                                const avail_h = win_h - TAB_H;
+                                if (win_w > 0 and avail_h > 0) {
+                                    var factor: f32 = 1.0;
+                                    var s: i32 = 0;
+                                    while (s < steps) : (s += 1) factor *= 1.2;
+                                    while (s > steps) : (s -= 1) factor /= 1.2;
+                                    const new_zoom = @min(32.0, @max(0.1, view.zoom * factor));
+                                    const applied = new_zoom / view.zoom;
+                                    var mx: c_int = 0;
+                                    var my: c_int = 0;
+                                    _ = c.SDL_GetMouseState(&mx, &my);
+                                    const fmx: f32 = @floatFromInt(mx);
+                                    const fmy: f32 = @floatFromInt(my);
+                                    const fww: f32 = @floatFromInt(win_w);
+                                    const fah: f32 = @floatFromInt(avail_h);
+                                    const cx = fww / 2 + view.ox;
+                                    const cy = @as(f32, @floatFromInt(TAB_H)) + fah / 2 + view.oy;
+                                    view.zoom = new_zoom;
+                                    const rs = renderedSize(img, win_w, avail_h, new_zoom);
+                                    view.ox = clampPan(fmx - (fmx - cx) * applied - fww / 2, rs.w);
+                                    view.oy = clampPan(fmy - (fmy - cy) * applied - (@as(f32, @floatFromInt(TAB_H)) + fah / 2), rs.h);
+                                    setTitle(window, allocator, tabs.paths.items[index], index, tabs.len(), view.zoom);
+                                }
+                            }
                         }
                     }
                 },
@@ -700,11 +838,46 @@ pub fn main(init: std.process.Init) !void {
                                     if (current) |old| image.destroy(old.texture);
                                     current = img;
                                     index = ni;
-                                    setTitle(window, allocator, tabs.paths.items[ni], ni, tabs.len());
+                                    view.reset();
+                                    setTitle(window, allocator, tabs.paths.items[ni], ni, tabs.len(), view.zoom);
                                     warmNeighbors(&tabs, ni);
                                 } else |_| {}
                             }
                             if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER or key == c.SDLK_SPACE) grid = false;
+                        }
+                    } else if ((key == c.SDLK_PLUS or key == c.SDLK_EQUALS or key == c.SDLK_KP_PLUS or
+                        key == c.SDLK_MINUS or key == c.SDLK_UNDERSCORE or key == c.SDLK_KP_MINUS or
+                        key == c.SDLK_0 or key == c.SDLK_KP_0 or
+                        key == c.SDLK_1 or key == c.SDLK_KP_1) and tabs.len() > 0)
+                    {
+                        // Keyboard zoom: + in, - out, 0 fit, 1 actual size.
+                        if (current) |img| {
+                            var win_w: c_int = 0;
+                            var win_h: c_int = 0;
+                            c.SDL_GetWindowSize(window, &win_w, &win_h);
+                            const avail_h = win_h - TAB_H;
+                            if (win_w > 0 and avail_h > 0 and img.w > 0 and img.h > 0) {
+                                if (key == c.SDLK_PLUS or key == c.SDLK_EQUALS or key == c.SDLK_KP_PLUS) {
+                                    view.zoom = @min(32.0, view.zoom * 1.25);
+                                } else if (key == c.SDLK_MINUS or key == c.SDLK_UNDERSCORE or key == c.SDLK_KP_MINUS) {
+                                    view.zoom = @max(0.1, view.zoom / 1.25);
+                                } else if (key == c.SDLK_0 or key == c.SDLK_KP_0) {
+                                    view.reset();
+                                } else {
+                                    // Actual size: rendered pixels == image pixels.
+                                    const swapped = img.orientation >= 5;
+                                    const ew: i32 = if (swapped) img.h else img.w;
+                                    const eh: i32 = if (swapped) img.w else img.h;
+                                    const fit = fitDims(ew, eh, win_w, avail_h);
+                                    view.zoom = @min(32.0, @max(0.1, @as(f32, @floatFromInt(ew)) / @as(f32, @floatFromInt(fit.w))));
+                                    view.ox = 0;
+                                    view.oy = 0;
+                                }
+                                const rs = renderedSize(img, win_w, avail_h, view.zoom);
+                                view.ox = clampPan(view.ox, rs.w);
+                                view.oy = clampPan(view.oy, rs.h);
+                                setTitle(window, allocator, tabs.paths.items[index], index, tabs.len(), view.zoom);
+                            }
                         }
                     } else if (key == c.SDLK_ESCAPE) {
                         running = false;
@@ -722,7 +895,8 @@ pub fn main(init: std.process.Init) !void {
                                 if (current) |old| image.destroy(old.texture);
                                 current = img;
                                 index = ni;
-                                setTitle(window, allocator, tabs.paths.items[ni], ni, tabs.len());
+                                view.reset();
+                                setTitle(window, allocator, tabs.paths.items[ni], ni, tabs.len(), view.zoom);
                                 warmNeighbors(&tabs, ni);
                             } else |_| {}
                         }
@@ -813,27 +987,15 @@ pub fn main(init: std.process.Init) !void {
             // Minimized or sliver windows report zero/negative space.
             // Skip the blit instead of dividing by zero (#2).
             if (win_w > 0 and avail_h > 0 and img.w > 0 and img.h > 0) {
-                // EXIF orientation (#6): values 5-8 transpose the pixels,
-                // so fit against the swapped dimensions.
-                const swapped = img.orientation >= 5;
-                const ew: i32 = if (swapped) img.h else img.w;
-                const eh: i32 = if (swapped) img.w else img.h;
-                const img_ratio = @as(f32, @floatFromInt(ew)) / @as(f32, @floatFromInt(eh));
-                const win_ratio = @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(avail_h));
+                const rs = renderedSize(img, win_w, avail_h, view.zoom);
                 var dst: c.SDL_Rect = undefined;
-                if (img_ratio > win_ratio) {
-                    dst.w = win_w;
-                    dst.h = @intFromFloat(@as(f32, @floatFromInt(win_w)) / img_ratio);
-                } else {
-                    dst.h = avail_h;
-                    dst.w = @intFromFloat(@as(f32, @floatFromInt(avail_h)) * img_ratio);
-                }
-                // Clamp rounding overshoot, then center.
-                if (dst.w > win_w) dst.w = win_w;
-                if (dst.h > avail_h) dst.h = avail_h;
+                dst.w = rs.w;
+                dst.h = rs.h;
+                // Center, plus the pan offset. Oversized (zoomed-in) rects
+                // are clipped by SDL and the checkerboard clip.
+                dst.x = @divTrunc(win_w - dst.w, 2) + @as(i32, @intFromFloat(view.ox));
+                dst.y = TAB_H + @divTrunc(avail_h - dst.h, 2) + @as(i32, @intFromFloat(view.oy));
                 if (dst.w > 0 and dst.h > 0) {
-                    dst.x = @divTrunc(win_w - dst.w, 2);
-                    dst.y = TAB_H + @divTrunc(avail_h - dst.h, 2);
                     renderCheckerboard(renderer, &dst);
                     // EXIF orientation at render time (#6): a viewer rotates
                     // the blit instead of rewriting pixels. Angle/flip per

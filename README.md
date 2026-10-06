@@ -49,6 +49,11 @@ zig build run -- ~/Pictures/*.jpg
 |----------------------|-----------------------------------------|
 | Right / d / Space    | Next image                              |
 | Left / a             | Previous image                          |
+| + / = / wheel up     | Zoom in (anchored at cursor for wheel)  |
+| - / wheel down       | Zoom out                                |
+| 0                    | Reset zoom (fit to window)              |
+| 1                    | Actual size (100%)                      |
+| drag                 | Pan when zoomed                         |
 | g                    | Toggle thumbnail grid                   |
 | Up / Down (in grid)  | Move selection by one row               |
 | Enter / Space (grid) | Open selected, exit grid                |
