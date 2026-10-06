@@ -1,0 +1,12 @@
+.{
+    .name = .imgv,
+    .version = "0.16.0",
+    .dependencies = .{
+        .wayland = .{
+            .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.6.0.tar.gz",
+            .hash = "wayland-0.6.0-lQa1kqz8AQADQmdNJsNhLoNHcnEGEUjrOaPV-dtEnEmX",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xb4bf168ffc9cf412,
+}

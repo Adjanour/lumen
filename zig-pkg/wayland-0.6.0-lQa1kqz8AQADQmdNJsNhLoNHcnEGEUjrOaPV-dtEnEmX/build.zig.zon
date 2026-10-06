@@ -1,0 +1,13 @@
+.{
+    .name = .wayland,
+    .version = "0.6.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+    },
+    .dependencies = .{},
+    .fingerprint = 0xa8d655e92b50695,
+}
