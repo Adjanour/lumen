@@ -14,7 +14,15 @@ get one window with left/right navigation.
 ## Dependencies (Arch/Omarchy)
 
 ```
-sudo pacman -S zig sdl2
+sudo pacman -S zig sdl2 sdl2_ttf libjpeg-turbo libwebp
+```
+
+On current Arch with GCC 16, plain `zig build` hits the Zig 0.16
+`.sframe` linker incompatibility — build through the workaround instead:
+
+```
+./build-gcc16.sh
+./zig-out/bin/imgv ~/Pictures/*.jpg
 ```
 
 (`zig` in Arch's `extra` repo is 0.16.0 — the code here targets that
@@ -37,14 +45,20 @@ zig build run -- ~/Pictures/*.jpg
 
 ## Keybindings
 
-| Key                  | Action        |
-|----------------------|---------------|
-| Right / d / Space    | Next image    |
-| Left / a             | Previous image|
-| Escape / q           | Quit          |
+| Key                  | Action                                  |
+|----------------------|-----------------------------------------|
+| Right / d / Space    | Next image                              |
+| Left / a             | Previous image                          |
+| g                    | Toggle thumbnail grid                   |
+| Up / Down (in grid)  | Move selection by one row               |
+| Enter / Space (grid) | Open selected, exit grid                |
+| Esc (in grid)        | Exit grid                               |
+| Escape / q           | Quit                                    |
 
 Window is resizable; the image is scaled to fit while preserving aspect
-ratio.
+ratio. Rendering uses linear filtering, a checkerboard behind transparent
+pixels, and honors the EXIF orientation tag, so phone photos display the
+way other viewers show them.
 
 ## Making it your default / fixing the "one window per image" problem
 
@@ -65,21 +79,24 @@ files to a single invocation instead of launching one process per file.
 Then set it as the default handler:
 
 ```
-xdg-mime default imgv.desktop image/png image/jpeg
+xdg-mime default imgv.desktop image/png image/jpeg image/webp
 ```
 
-## Known limitation
+## Formats
 
-Image decoding uses `stb_image`, which does **not** support WebP (this is
-actually the same complaint that's been raised about `imv` — see
-Omarchy issue #1442). JPEG, PNG, BMP, GIF, TGA, PSD, HDR are all fine.
-Adding WebP support would mean linking `libwebp` and branching on file
-extension/magic bytes in `loadImage`.
+Format dispatch is by magic bytes, not file extension: PNG (8-byte
+signature), JPEG (`FF D8`), and WebP (`RIFF....WEBP`) are sniffed from
+the file header, so a PNG renamed to `.jpg` still decodes. JPEGs prefer
+libjpeg-turbo with an stb_image fallback; WebP decodes via libwebp;
+everything else (PNG, GIF, BMP, TGA...) goes through stb_image.
+
+System dependency for WebP:
+
+```
+sudo pacman -S --needed libwebp
+```
 
 ## Where to go next
 
-- Thumbnail strip / grid view
-- EXIF orientation handling (currently images aren't auto-rotated)
-- WebP via libwebp
 - Slideshow mode
 - Delete/rename keybindings for quick culling

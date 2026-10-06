@@ -5,4 +5,5 @@ pub const c = @cImport({
     @cInclude("SDL2/SDL_ttf.h");
     @cInclude("stb_image.h");
     @cInclude("turbojpeg.h");
+    @cInclude("webp/decode.h");
 });

@@ -63,6 +63,66 @@ const Tabs = struct {
     }
 };
 
+//Thumbnail grid cache (#7)
+//
+// The grid keeps many textures alive at once, so it runs under a fixed
+// budget: at most THUMB_BUDGET thumbnails (160px long edge, ~100KB each,
+// ~6.4MB total). Misses decode on demand; when full, the entry farthest
+// from the selection is evicted (visible range plus margin). Indices stay
+// valid because every tab add/remove clears the cache.
+const THUMB_BUDGET: usize = 64;
+const THUMB_TARGET: i32 = 160;
+const GRID_CELL: i32 = 184;
+const GRID_LABEL_MAX: usize = 20;
+
+const ThumbEntry = struct {
+    tab: usize,
+    thumb: image.Thumb,
+};
+
+const ThumbCache = struct {
+    entries: std.ArrayList(ThumbEntry) = .empty,
+
+    fn clear(self: *ThumbCache) void {
+        for (self.entries.items) |e| c.SDL_DestroyTexture(e.thumb.texture);
+        self.entries.clearRetainingCapacity();
+    }
+
+    fn evictFarthest(self: *ThumbCache, sel: usize) void {
+        var best: usize = 0;
+        var best_d: usize = 0;
+        for (self.entries.items, 0..) |e, i| {
+            const d = if (e.tab > sel) e.tab - sel else sel - e.tab;
+            if (d >= best_d) {
+                best_d = d;
+                best = i;
+            }
+        }
+        const e = self.entries.orderedRemove(best);
+        c.SDL_DestroyTexture(e.thumb.texture);
+    }
+
+    fn getOrLoad(
+        self: *ThumbCache,
+        allocator: std.mem.Allocator,
+        renderer: *c.SDL_Renderer,
+        tab: usize,
+        path: [:0]const u8,
+        sel: usize,
+    ) ?*image.Thumb {
+        for (self.entries.items) |*e| {
+            if (e.tab == tab) return &e.thumb;
+        }
+        if (self.entries.items.len >= THUMB_BUDGET) self.evictFarthest(sel);
+        const t = image.loadThumb(renderer, path, THUMB_TARGET) catch return null;
+        self.entries.append(allocator, .{ .tab = tab, .thumb = t }) catch {
+            c.SDL_DestroyTexture(t.texture);
+            return null;
+        };
+        return &self.entries.items[self.entries.items.len - 1].thumb;
+    }
+};
+
 //Utilities
 fn basename(path: []const u8) []const u8 {
     var i = path.len;
@@ -89,11 +149,20 @@ fn setTitle(
     c.SDL_SetWindowTitle(window, title.ptr);
 }
 
+/// Warm both neighbors of the selected tab: N+1 into the forward slot,
+/// N-1 into the backward slot (#4). Forward and backward prefetches live
+/// in separate cache slots so they never evict each other.
+fn warmNeighbors(tabs: *const Tabs, index: usize) void {
+    if (index + 1 < tabs.len()) image.preloadNext(tabs.paths.items[index + 1]);
+    if (index > 0) image.preloadPrev(tabs.paths.items[index - 1]);
+}
+
 /// Close the tab at `target`, adjust `index`, and reload if needed.
 /// Fixes the original bug where clicking any close button always closed the
 /// currently-selected tab rather than the one that was clicked.
 fn closeTabAt(
     tabs: *Tabs,
+    cache: *ThumbCache,
     current: *?image.Image,
     index: *usize,
     target: usize,
@@ -103,10 +172,11 @@ fn closeTabAt(
     font: ?*c.TTF_Font,
 ) bool {
     if (tabs.len() == 0) return false;
+    cache.clear();
     tabs.removeAt(target);
     if (tabs.len() == 0) {
         if (current.*) |img| {
-            c.SDL_DestroyTexture(img.texture);
+            image.destroy(img.texture);
             current.* = null;
         }
         return false;
@@ -114,7 +184,7 @@ fn closeTabAt(
 
     if (target == index.*) {
         // The current tab was closed; load whatever is now at the same slot.
-        if (current.*) |img| c.SDL_DestroyTexture(img.texture);
+        if (current.*) |img| image.destroy(img.texture);
         if (index.* >= tabs.len()) index.* = tabs.len() - 1;
         if (image.loadImage(renderer, tabs.paths.items[index.*])) |img| {
             current.* = img;
@@ -127,7 +197,7 @@ fn closeTabAt(
     }
 
     setTitle(window, allocator, tabs.paths.items[index.*], index.*, tabs.len());
-    if (index.* + 1 < tabs.len()) image.preloadNext(tabs.paths.items[index.* + 1]);
+    warmNeighbors(tabs, index.*);
     _ = font;
     return true;
 }
@@ -189,6 +259,185 @@ fn renderCenteredText(
         };
         _ = c.SDL_RenderCopy(renderer, tex, null, &dst);
     }
+}
+
+/// Draw the placeholder shown when tabs exist but the selected image failed
+/// to load (bad file, unsupported format, decode error).
+fn renderFailedState(
+    renderer: *c.SDL_Renderer,
+    window: *c.SDL_Window,
+    font: *c.TTF_Font,
+    name: []const u8,
+) void {
+    var win_w: c_int = 0;
+    var win_h: c_int = 0;
+    c.SDL_GetWindowSize(window, &win_w, &win_h);
+    const cx = @divTrunc(win_w, 2);
+    const cy = TAB_H + @divTrunc(win_h - TAB_H, 2);
+
+    renderCenteredText(
+        renderer,
+        font,
+        "Could not load this image",
+        c.SDL_Color{ .r = 200, .g = 120, .b = 120, .a = 255 },
+        cx,
+        cy - 14,
+    );
+    // basename into a null-terminated scratch buffer for TTF.
+    var scratch: [512]u8 = undefined;
+    const base = basename(name);
+    const n = @min(base.len, scratch.len - 1);
+    @memcpy(scratch[0..n], base[0..n]);
+    scratch[n] = 0;
+    renderCenteredText(
+        renderer,
+        font,
+        @ptrCast(&scratch),
+        c.SDL_Color{ .r = 120, .g = 120, .b = 120, .a = 255 },
+        cx,
+        cy + 14,
+    );
+}
+
+/// Fill `dst` with a subtle checkerboard so transparent pixels read as
+/// transparent instead of as dark smudges. Clipped to the image rect so
+/// oversized tabs never paint outside the frame.
+fn renderCheckerboard(renderer: *c.SDL_Renderer, dst: *const c.SDL_Rect) void {
+    var clip = dst.*;
+    _ = c.SDL_RenderSetClipRect(renderer, &clip);
+    defer _ = c.SDL_RenderSetClipRect(renderer, null);
+    const step: c_int = 16;
+    var yy: c_int = dst.y;
+    var row: c_int = 0;
+    while (yy < dst.y + dst.h) : ({
+        yy += step;
+        row += 1;
+    }) {
+        var xx: c_int = dst.x;
+        var col: c_int = 0;
+        while (xx < dst.x + dst.w) : ({
+            xx += step;
+            col += 1;
+        }) {
+            const v: u8 = if ((row + col) & 1 == 0) 38 else 48;
+            _ = c.SDL_SetRenderDrawColor(renderer, v, v, v, 255);
+            var cell = c.SDL_Rect{
+                .x = xx,
+                .y = yy,
+                .w = @min(step, dst.x + dst.w - xx),
+                .h = @min(step, dst.y + dst.h - yy),
+            };
+            _ = c.SDL_RenderFillRect(renderer, &cell);
+        }
+    }
+}
+
+/// Columns in the grid for the current window width. Always >= 1 so a
+/// sliver window degrades to a single column instead of dividing by zero.
+fn gridColumns(window: *c.SDL_Window) i32 {
+    var win_w: c_int = 0;
+    c.SDL_GetWindowSize(window, &win_w, null);
+    if (win_w < GRID_CELL) return 1;
+    return @divTrunc(win_w, GRID_CELL);
+}
+
+/// Render the thumbnail grid (#7). Returns the adjusted top row so the
+/// selection stays visible after scrolling. Failed thumbnails draw as a
+/// dim placeholder box instead of breaking the layout.
+fn renderGrid(
+    renderer: *c.SDL_Renderer,
+    window: *c.SDL_Window,
+    font: ?*c.TTF_Font,
+    tabs: *Tabs,
+    cache: *ThumbCache,
+    allocator: std.mem.Allocator,
+    index: usize,
+    top: usize,
+) usize {
+    var win_w: c_int = 0;
+    var win_h: c_int = 0;
+    c.SDL_GetWindowSize(window, &win_w, &win_h);
+    const cols: usize = @intCast(gridColumns(window));
+    const avail_h = win_h - TAB_H;
+    const max_rows: usize = if (avail_h > 0) @intCast(@max(1, @divTrunc(avail_h + GRID_CELL - 1, GRID_CELL))) else 1;
+
+    var new_top = top;
+    const sel_row = index / cols;
+    if (sel_row < new_top) new_top = sel_row;
+    if (sel_row >= new_top + max_rows) new_top = sel_row - max_rows + 1;
+
+    var r: usize = new_top;
+    while (true) : (r += 1) {
+        const y = TAB_H + @as(i32, @intCast((r - new_top) * @as(usize, @intCast(GRID_CELL))));
+        if (y >= win_h) break;
+        var cc: usize = 0;
+        while (cc < cols) : (cc += 1) {
+            const tab = r * cols + cc;
+            if (tab >= tabs.len()) break;
+            const x: i32 = @intCast(cc * @as(usize, @intCast(GRID_CELL)));
+            var cell = c.SDL_Rect{ .x = x, .y = y, .w = GRID_CELL - 8, .h = GRID_CELL - 8 };
+            const is_sel = tab == index;
+            const bg: u8 = if (is_sel) 70 else 34;
+            _ = c.SDL_SetRenderDrawColor(renderer, bg, bg, bg + 8, 255);
+            _ = c.SDL_RenderFillRect(renderer, &cell);
+            const edge: u8 = if (is_sel) 140 else 70;
+            _ = c.SDL_SetRenderDrawColor(renderer, edge, edge, edge, 255);
+            _ = c.SDL_RenderDrawRect(renderer, &cell);
+
+            const box: i32 = 144;
+            const bx = x + @divTrunc(GRID_CELL - 8 - box, 2);
+            const by = y + 8;
+            if (cache.getOrLoad(allocator, renderer, tab, tabs.paths.items[tab], index)) |t| {
+                var dst = c.SDL_Rect{ .w = t.w, .h = t.h, .x = 0, .y = 0 };
+                // Fit thumb inside the box, centered.
+                if (t.w > box or t.h > box) {
+                    const tr = @as(f32, @floatFromInt(t.w)) / @as(f32, @floatFromInt(t.h));
+                    if (tr > 1) {
+                        dst.w = box;
+                        dst.h = @intFromFloat(@as(f32, @floatFromInt(box)) / tr);
+                    } else {
+                        dst.h = box;
+                        dst.w = @intFromFloat(@as(f32, @floatFromInt(box)) * tr);
+                    }
+                }
+                dst.x = bx + @divTrunc(box - dst.w, 2);
+                dst.y = by + @divTrunc(box - dst.h, 2);
+                _ = c.SDL_RenderCopy(renderer, t.texture, null, &dst);
+            } else {
+                var ph = c.SDL_Rect{ .x = bx, .y = by, .w = box, .h = box };
+                _ = c.SDL_SetRenderDrawColor(renderer, 60, 50, 50, 255);
+                _ = c.SDL_RenderFillRect(renderer, &ph);
+                if (font) |f| renderCenteredText(renderer, f, "?", .{ .r = 150, .g = 120, .b = 120, .a = 255 }, bx + @divTrunc(box, 2), by + @divTrunc(box, 2));
+            }
+
+            // Label: truncated basename under the thumbnail.
+            if (font) |f| {
+                const base = basename(std.mem.sliceTo(tabs.paths.items[tab].ptr, 0));
+                var scratch: [GRID_LABEL_MAX + 1]u8 = undefined;
+                const n = @min(base.len, GRID_LABEL_MAX);
+                @memcpy(scratch[0..n], base[0..n]);
+                scratch[n] = 0;
+                const surf = c.TTF_RenderUTF8_Blended(f, @ptrCast(&scratch), .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                if (surf) |s| {
+                    defer c.SDL_FreeSurface(surf);
+                    if (c.SDL_CreateTextureFromSurface(renderer, s)) |tex| {
+                        defer c.SDL_DestroyTexture(tex);
+                        var dst = c.SDL_Rect{
+                            .x = x + @divTrunc(GRID_CELL - 8 - s.*.w, 2),
+                            .y = y + GRID_CELL - 8 - s.*.h - 4,
+                            .w = s.*.w,
+                            .h = s.*.h,
+                        };
+                        if (dst.x < x) dst.x = x;
+                        _ = c.SDL_RenderCopy(renderer, tex, null, &dst);
+                    }
+                }
+            }
+        }
+        if ((r - new_top + 1) >= max_rows) break;
+        if ((r + 1) * cols >= tabs.len()) break;
+    }
+    return new_top;
 }
 
 /// Draw the placeholder shown when no images are open.
@@ -270,13 +519,17 @@ pub fn main(init: std.process.Init) !void {
         c.SDL_WINDOWPOS_CENTERED,
         1024,
         768,
-        c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_SHOWN,
+        c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_SHOWN | c.SDL_WINDOW_ALLOW_HIGHDPI,
     ) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.WindowCreateFailed;
     };
     defer c.SDL_DestroyWindow(window);
     setWindowIcon(window);
+
+    // Nicer scaling: linear filtering for the fit-to-window blit. Must be
+    // set before textures are created.
+    _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "2");
 
     const renderer = c.SDL_CreateRenderer(window, -1, c.SDL_RENDERER_ACCELERATED) orelse
         c.SDL_CreateRenderer(window, -1, c.SDL_RENDERER_SOFTWARE) orelse {
@@ -292,11 +545,34 @@ pub fn main(init: std.process.Init) !void {
     var index: usize = 0;
     var current: ?image.Image = null;
     if (tabs.len() > 0) {
-        current = try image.loadImage(renderer, tabs.paths.items[0]);
-        setTitle(window, allocator, tabs.paths.items[0], 0, tabs.len());
-        if (tabs.len() > 1) image.preloadNext(tabs.paths.items[1]);
+        // Try each tab in order: a bad first file (missing, zero-byte,
+        // not-an-image) must not kill startup. First success wins.
+        var loaded: ?usize = null;
+        for (tabs.paths.items, 0..) |p, i| {
+            if (image.loadImage(renderer, p)) |img| {
+                current = img;
+                loaded = i;
+                break;
+            } else |_| {}
+        }
+        if (loaded) |li| {
+            index = li;
+            setTitle(window, allocator, tabs.paths.items[li], li, tabs.len());
+            warmNeighbors(&tabs, li);
+        } else {
+            // Nothing decodable: keep the tabs so the user can see what
+            // failed, with the first tab selected.
+            index = 0;
+            setTitle(window, allocator, tabs.paths.items[0], 0, tabs.len());
+        }
     }
     defer image.cleanup();
+
+    //Grid state (#7)
+    var grid: bool = false;
+    var grid_top: usize = 0;
+    var thumbs: ThumbCache = .{};
+    defer thumbs.clear();
 
     //Event / render loop
     var running = true;
@@ -317,14 +593,15 @@ pub fn main(init: std.process.Init) !void {
             }
             pending.clearRetainingCapacity();
             if (added > 0) {
+                thumbs.clear(); // indices shifted; drop stale thumbnails
                 if (image.loadImage(renderer, tabs.paths.items[old_len])) |img| {
-                    if (current) |old| c.SDL_DestroyTexture(old.texture);
+                    if (current) |old| image.destroy(old.texture);
                     current = img;
                     index = old_len;
                 } else |_| {}
                 setTitle(window, allocator, tabs.paths.items[index], index, tabs.len());
                 c.SDL_RaiseWindow(window);
-                if (index + 1 < tabs.len()) image.preloadNext(tabs.paths.items[index + 1]);
+                warmNeighbors(&tabs, index);
             }
         }
 
@@ -335,7 +612,25 @@ pub fn main(init: std.process.Init) !void {
                 c.SDL_QUIT => running = false,
 
                 c.SDL_MOUSEBUTTONDOWN => {
-                    if (event.button.y < TAB_H) {
+                    if (grid and tabs.len() > 0) {
+                        // Grid click: select the clicked cell and exit.
+                        const cols: usize = @intCast(gridColumns(window));
+                        if (event.button.y >= TAB_H) {
+                            const cc: usize = @intCast(@divTrunc(event.button.x, GRID_CELL));
+                            const rr: usize = grid_top + @as(usize, @intCast(@divTrunc(event.button.y - TAB_H, GRID_CELL)));
+                            const tab = rr * cols + cc;
+                            if (tab < tabs.len() and tab != index) {
+                                if (image.loadImage(renderer, tabs.paths.items[tab])) |img| {
+                                    if (current) |old| image.destroy(old.texture);
+                                    current = img;
+                                    index = tab;
+                                    setTitle(window, allocator, tabs.paths.items[tab], tab, tabs.len());
+                                    warmNeighbors(&tabs, tab);
+                                } else |_| {}
+                            }
+                            grid = false;
+                        }
+                    } else if (event.button.y < TAB_H) {
                         var x: i32 = 0;
                         for (tabs.widths.items, 0..) |tab_w, i| {
                             const close_x = x + tab_w - 18;
@@ -346,7 +641,7 @@ pub fn main(init: std.process.Init) !void {
                             {
                                 // Pass `i` so we close the clicked tab, not
                                 // necessarily the currently-selected one.
-                                _ = closeTabAt(&tabs, &current, &index, i, allocator, renderer, window, font);
+                                _ = closeTabAt(&tabs, &thumbs, &current, &index, i, allocator, renderer, window, font);
                                 // Don't exit when the last tab closes — show
                                 // the empty state and wait for new handoffs.
                                 break;
@@ -354,12 +649,11 @@ pub fn main(init: std.process.Init) !void {
                             if (event.button.x >= x and event.button.x < x + tab_w) {
                                 if (i != index) {
                                     if (image.loadImage(renderer, tabs.paths.items[i])) |img| {
-                                        if (current) |old| c.SDL_DestroyTexture(old.texture);
+                                        if (current) |old| image.destroy(old.texture);
                                         current = img;
                                         index = i;
                                         setTitle(window, allocator, tabs.paths.items[i], i, tabs.len());
-                                        if (i + 1 < tabs.len())
-                                            image.preloadNext(tabs.paths.items[i + 1]);
+                                        warmNeighbors(&tabs, i);
                                     } else |_| {}
                                 }
                                 break;
@@ -371,7 +665,48 @@ pub fn main(init: std.process.Init) !void {
 
                 c.SDL_KEYDOWN => {
                     const key = event.key.keysym.sym;
-                    if (key == c.SDLK_ESCAPE or key == c.SDLK_q) {
+                    if (key == c.SDLK_q) {
+                        running = false;
+                    } else if (key == c.SDLK_g and tabs.len() > 0) {
+                        // Toggle the thumbnail grid (#7).
+                        grid = !grid;
+                        if (grid) {
+                            const cols: usize = @intCast(gridColumns(window));
+                            grid_top = index / cols;
+                        }
+                    } else if (grid and key == c.SDLK_ESCAPE) {
+                        grid = false;
+                    } else if (grid) {
+                        // Grid navigation: arrows move the live selection,
+                        // Enter/Space confirm (selection is already live).
+                        const cols: usize = @intCast(gridColumns(window));
+                        const new_index: ?usize =
+                            if ((key == c.SDLK_RIGHT or key == c.SDLK_d) and index + 1 < tabs.len())
+                                index + 1
+                            else if ((key == c.SDLK_LEFT or key == c.SDLK_a) and index > 0)
+                                index - 1
+                            else if ((key == c.SDLK_DOWN or key == c.SDLK_SPACE) and index + cols < tabs.len())
+                                index + cols
+                            else if (key == c.SDLK_UP and index >= cols)
+                                index - cols
+                            else if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER)
+                                index
+                            else
+                                null;
+
+                        if (new_index) |ni| {
+                            if (ni != index) {
+                                if (image.loadImage(renderer, tabs.paths.items[ni])) |img| {
+                                    if (current) |old| image.destroy(old.texture);
+                                    current = img;
+                                    index = ni;
+                                    setTitle(window, allocator, tabs.paths.items[ni], ni, tabs.len());
+                                    warmNeighbors(&tabs, ni);
+                                } else |_| {}
+                            }
+                            if (key == c.SDLK_RETURN or key == c.SDLK_KP_ENTER or key == c.SDLK_SPACE) grid = false;
+                        }
+                    } else if (key == c.SDLK_ESCAPE) {
                         running = false;
                     } else {
                         const new_index: ?usize = if ((key == c.SDLK_RIGHT or key == c.SDLK_SPACE or key == c.SDLK_d) and
@@ -384,12 +719,11 @@ pub fn main(init: std.process.Init) !void {
 
                         if (new_index) |ni| {
                             if (image.loadImage(renderer, tabs.paths.items[ni])) |img| {
-                                if (current) |old| c.SDL_DestroyTexture(old.texture);
+                                if (current) |old| image.destroy(old.texture);
                                 current = img;
                                 index = ni;
                                 setTitle(window, allocator, tabs.paths.items[ni], ni, tabs.len());
-                                if (ni + 1 < tabs.len())
-                                    image.preloadNext(tabs.paths.items[ni + 1]);
+                                warmNeighbors(&tabs, ni);
                             } else |_| {}
                         }
                     }
@@ -461,30 +795,70 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (current == null) {
-            if (font) |f| renderEmptyState(renderer, window, f);
+        if (grid and tabs.len() > 0) {
+            grid_top = renderGrid(renderer, window, font, &tabs, &thumbs, allocator, index, grid_top);
+        } else if (current == null) {
+            if (font) |f| {
+                if (tabs.len() > 0) {
+                    renderFailedState(renderer, window, f, std.mem.sliceTo(tabs.paths.items[index].ptr, 0));
+                } else {
+                    renderEmptyState(renderer, window, f);
+                }
+            }
         } else if (current) |img| {
             var win_w: c_int = 0;
             var win_h: c_int = 0;
             c.SDL_GetWindowSize(window, &win_w, &win_h);
             const avail_h = win_h - TAB_H;
-            const img_ratio = @as(f32, @floatFromInt(img.w)) / @as(f32, @floatFromInt(img.h));
-            const win_ratio = @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(avail_h));
-            var dst: c.SDL_Rect = undefined;
-            if (img_ratio > win_ratio) {
-                dst.w = win_w;
-                dst.h = @intFromFloat(@as(f32, @floatFromInt(win_w)) / img_ratio);
-            } else {
-                dst.h = avail_h;
-                dst.w = @intFromFloat(@as(f32, @floatFromInt(avail_h)) * img_ratio);
+            // Minimized or sliver windows report zero/negative space.
+            // Skip the blit instead of dividing by zero (#2).
+            if (win_w > 0 and avail_h > 0 and img.w > 0 and img.h > 0) {
+                // EXIF orientation (#6): values 5-8 transpose the pixels,
+                // so fit against the swapped dimensions.
+                const swapped = img.orientation >= 5;
+                const ew: i32 = if (swapped) img.h else img.w;
+                const eh: i32 = if (swapped) img.w else img.h;
+                const img_ratio = @as(f32, @floatFromInt(ew)) / @as(f32, @floatFromInt(eh));
+                const win_ratio = @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(avail_h));
+                var dst: c.SDL_Rect = undefined;
+                if (img_ratio > win_ratio) {
+                    dst.w = win_w;
+                    dst.h = @intFromFloat(@as(f32, @floatFromInt(win_w)) / img_ratio);
+                } else {
+                    dst.h = avail_h;
+                    dst.w = @intFromFloat(@as(f32, @floatFromInt(avail_h)) * img_ratio);
+                }
+                // Clamp rounding overshoot, then center.
+                if (dst.w > win_w) dst.w = win_w;
+                if (dst.h > avail_h) dst.h = avail_h;
+                if (dst.w > 0 and dst.h > 0) {
+                    dst.x = @divTrunc(win_w - dst.w, 2);
+                    dst.y = TAB_H + @divTrunc(avail_h - dst.h, 2);
+                    renderCheckerboard(renderer, &dst);
+                    // EXIF orientation at render time (#6): a viewer rotates
+                    // the blit instead of rewriting pixels. Angle/flip per
+                    // the 8 EXIF values; transpose cases were pre-swapped
+                    // into dst above.
+                    const center = c.SDL_Point{ .x = @divTrunc(dst.w, 2), .y = @divTrunc(dst.h, 2) };
+                    switch (img.orientation) {
+                        2 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 0, &center, c.SDL_FLIP_HORIZONTAL),
+                        3 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 180, &center, c.SDL_FLIP_NONE),
+                        4 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 0, &center, c.SDL_FLIP_VERTICAL),
+                        5 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 90, &center, c.SDL_FLIP_HORIZONTAL),
+                        6 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 90, &center, c.SDL_FLIP_NONE),
+                        7 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 90, &center, c.SDL_FLIP_VERTICAL),
+                        8 => _ = c.SDL_RenderCopyEx(renderer, img.texture, null, &dst, 270, &center, c.SDL_FLIP_NONE),
+                        else => _ = c.SDL_RenderCopy(renderer, img.texture, null, &dst),
+                    }
+                    _ = c.SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+                    _ = c.SDL_RenderDrawRect(renderer, &dst);
+                }
             }
-            dst.x = @divTrunc(win_w - dst.w, 2);
-            dst.y = TAB_H + @divTrunc(avail_h - dst.h, 2);
-            _ = c.SDL_RenderCopy(renderer, img.texture, null, &dst);
         }
 
         c.SDL_RenderPresent(renderer);
     }
 
-    if (current) |img| c.SDL_DestroyTexture(img.texture);
+    if (current) |img| image.destroy(img.texture);
+    std.debug.print("texture counter at shutdown: {d} (expect 0)\n", .{image.textureCount()});
 }
